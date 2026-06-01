@@ -242,3 +242,117 @@ def get_model_adapter() -> ModelAdapter:
         return AnthropicAdapter()
 
     return StubAdapter()
+
+
+# ======================================================================= #
+# Tester agent — TestPlan, StubTesterAdapter, TesterAdapter                #
+# ======================================================================= #
+
+@dataclass
+class TestPlan:
+    summary: str
+    target_source_files: list[str]   # source files to cover with tests
+    test_cases: str                   # human-readable description of what to test
+    test_file_path: str               # relative path to write/update the test file
+
+
+class StubTesterAdapter:
+    def plan_tests(self, feature: str, repo_files: list[str], file_previews: dict[str, str]) -> TestPlan:
+        return TestPlan(
+            summary=f"Stub test plan for: {feature}",
+            target_source_files=repo_files[:2],
+            test_cases="Stub: no real test cases.",
+            test_file_path="src/__tests__/stub.test.js",
+        )
+
+    def generate_test_files(self, feature: str, plan: TestPlan, file_contents: dict[str, str]) -> AgentEdits:
+        return AgentEdits(edits=[], summary="Stub: no test files generated.")
+
+
+class TesterAdapter(AnthropicAdapter):
+    """Extends AnthropicAdapter with test-planning and test-generation capabilities."""
+
+    def plan_tests(self, feature: str, repo_files: list[str], file_previews: dict[str, str]) -> TestPlan:
+        system = (
+            "You are a careful QA engineer for a React operations dashboard repository. "
+            "Your job is to identify which source files should be tested, define the key test scenarios, "
+            "and decide where to write the test file. "
+            "Respond ONLY as valid JSON. Do not use markdown. Do not use code fences."
+        )
+        prompt = self._build_test_plan_prompt(feature, repo_files, file_previews)
+        raw_text = self._call_api(system, prompt, max_tokens=1024)
+        parsed = self._parse_json(raw_text)
+
+        return TestPlan(
+            summary=parsed.get("summary", ""),
+            target_source_files=parsed.get("target_source_files", []),
+            test_cases=parsed.get("test_cases", ""),
+            test_file_path=parsed.get("test_file_path", "src/__tests__/generated.test.js"),
+        )
+
+    def generate_test_files(self, feature: str, plan: TestPlan, file_contents: dict[str, str]) -> AgentEdits:
+        system = (
+            "You are a careful QA engineer writing Jest and React Testing Library tests for a React app. "
+            "Write complete, runnable test files. "
+            "Respond ONLY as valid JSON. Do not use markdown. Do not use code fences."
+        )
+        prompt = self._build_test_generate_prompt(feature, plan, file_contents)
+        raw_text = self._call_api(system, prompt, max_tokens=4096)
+        result = self._parse_json(raw_text)
+
+        edits: list[FileEdit] = []
+        if result.get("new_content"):
+            edits.append(FileEdit(path=plan.test_file_path, new_content=result["new_content"]))
+
+        return AgentEdits(edits=edits, summary=plan.test_cases)
+
+    def _build_test_plan_prompt(self, feature: str, repo_files: list[str], file_previews: dict[str, str]) -> str:
+        previews_text = [f"FILE: {f}\n{p}" for f, p in file_previews.items()]
+        return f"""Feature / component to test:
+{feature}
+
+Available repo files:
+{json.dumps(repo_files, indent=2)}
+
+Relevant file previews:
+{chr(10).join(previews_text)}
+
+Return ONLY valid JSON using exactly this schema:
+{{
+  "summary": "short summary of what will be tested",
+  "target_source_files": ["src/components/Header.jsx"],
+  "test_cases": "describe the key test scenarios in plain English",
+  "test_file_path": "src/__tests__/Header.test.jsx"
+}}""".strip()
+
+    def _build_test_generate_prompt(self, feature: str, plan: TestPlan, file_contents: dict[str, str]) -> str:
+        files_section = "\n\n".join(
+            f"FILE: {path}\n{content}" for path, content in file_contents.items()
+        )
+        return f"""Feature / component to test:
+{feature}
+
+Test plan summary:
+{plan.summary}
+
+Test cases to cover:
+{plan.test_cases}
+
+Target test file path:
+{plan.test_file_path}
+
+Source files:
+{files_section}
+
+Write a complete Jest + React Testing Library test file for the test cases above.
+Import the components using relative paths from {plan.test_file_path}.
+Return ONLY valid JSON using exactly this schema:
+{{
+  "new_content": "full content of the test file"
+}}""".strip()
+
+
+def get_tester_adapter() -> StubTesterAdapter | TesterAdapter:
+    if MODEL_PROVIDER == "anthropic":
+        return TesterAdapter()
+    return StubTesterAdapter()
